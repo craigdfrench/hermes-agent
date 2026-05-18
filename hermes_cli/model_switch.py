@@ -1058,6 +1058,7 @@ def list_authenticated_providers(
     custom_providers: list | None = None,
     max_models: int = 8,
     current_model: str = "",
+    excluded_providers: list | None = None,
 ) -> List[dict]:
     """Detect which providers have credentials and list their curated models.
 
@@ -1093,6 +1094,8 @@ def list_authenticated_providers(
     results: List[dict] = []
     seen_slugs: set = set()  # lowercase-normalized to catch case variants (#9545)
     seen_mdev_ids: set = set()  # prevent duplicate entries for aliases (e.g. kimi-coding + kimi-coding-cn)
+    # Normalize excluded providers list for fast membership checks.
+    _excluded: set = {str(p).strip().lower() for p in (excluded_providers or []) if p}
     # Effective base URLs of every built-in row we emit (normalized lower+rstrip).
     # Section 4 uses this to hide ``custom_providers`` entries that point at the
     # same endpoint as a built-in (e.g. a user-defined "my-dashscope" on
@@ -1215,6 +1218,8 @@ def list_authenticated_providers(
         # The first one with valid credentials wins (#10526).
         if mdev_id in seen_mdev_ids:
             continue
+        if hermes_id.lower() in _excluded or mdev_id.lower() in _excluded:
+            continue
         pdata = data.get(mdev_id)
         if not isinstance(pdata, dict):
             continue
@@ -1292,6 +1297,8 @@ def list_authenticated_providers(
         # Resolve Hermes slug — e.g. "github-copilot" → "copilot"
         hermes_slug = _mdev_to_hermes.get(pid, pid)
         if hermes_slug.lower() in seen_slugs:
+            continue
+        if pid.lower() in _excluded or hermes_slug.lower() in _excluded:
             continue
 
         # Check if credentials exist
@@ -1409,6 +1416,8 @@ def list_authenticated_providers(
 
     for _cp in _canon_provs:
         if _cp.slug.lower() in seen_slugs:
+            continue
+        if _cp.slug.lower() in _excluded:
             continue
 
         # Check credentials via PROVIDER_REGISTRY (auth.py)
@@ -1585,9 +1594,13 @@ def list_authenticated_providers(
     if custom_providers and isinstance(custom_providers, list):
         from collections import OrderedDict
 
-        # Key by (base_url, api_key) instead of slug: names frequently
+        # Key by (base_url, api_key, display_name_prefix): names frequently
         # differ per model ("Ollama — X") while the endpoint stays the
         # same. Slug-based grouping left them as separate rows.
+        # The display_name_prefix (text before "—" or " - ") is included so
+        # that intentionally distinct providers sharing an endpoint (e.g. a
+        # proxy fronting cerebras, groq, perplexity at a single base_url) each
+        # get their own picker row rather than being collapsed into one.
         groups: "OrderedDict[tuple, dict]" = OrderedDict()
         for entry in custom_providers:
             if not isinstance(entry, dict):
@@ -1604,7 +1617,14 @@ def list_authenticated_providers(
                 continue
             api_key = (entry.get("api_key") or "").strip()
 
-            group_key = (api_url, api_key)
+            # Compute display_name prefix for grouping key
+            _display_prefix = raw_name
+            for sep in ("—", " - "):
+                if sep in _display_prefix:
+                    _display_prefix = _display_prefix.split(sep)[0].strip()
+                    break
+
+            group_key = (api_url, api_key, _display_prefix.lower())
             if group_key not in groups:
                 # Strip per-model suffix so "Ollama — GLM 5.1" becomes
                 # "Ollama" for the grouped row. Em dash is the convention
@@ -1617,23 +1637,27 @@ def list_authenticated_providers(
                         break
                 if not display_name:
                     display_name = raw_name
-                # If this endpoint matches the currently active one, use
-                # ``current_provider`` as the slug so picker-driven switches
-                # route through the live credential pipeline.
+                # If this endpoint matches the currently active one AND the
+                # provider name matches, use ``current_provider`` as the slug
+                # so picker-driven switches route through the live credential
+                # pipeline. When multiple custom providers share the same
+                # base_url (e.g. a proxy fronting several backends), each must
+                # keep its own canonical slug rather than all inheriting the
+                # active provider's slug.
+                _canonical_slug = custom_provider_slug(display_name)
                 if (
                     current_base_url
                     and api_url == current_base_url.strip().rstrip("/")
+                    and current_provider
+                    and current_provider not in ("custom", "")
+                    and current_provider == _canonical_slug
                 ):
                     # Guard against bare "custom" slug left by a prior
                     # failed switch — always resolve to the canonical
                     # custom:<name> form.  (GH #17478)
-                    slug = (
-                        current_provider
-                        if current_provider and current_provider != "custom"
-                        else custom_provider_slug(display_name)
-                    )
+                    slug = current_provider
                 else:
-                    slug = custom_provider_slug(display_name)
+                    slug = _canonical_slug
                 groups[group_key] = {
                     "slug": slug,
                     "name": display_name,
@@ -1662,7 +1686,7 @@ def list_authenticated_providers(
 
         _section4_emitted_slugs: set = set()
         for grp_key, grp in groups.items():
-            api_url, api_key = grp_key
+            api_url, api_key, _name_prefix = grp_key
             slug = grp["slug"]
             # If the slug is already claimed by a built-in / overlay /
             # user-provider row (sections 1-3), skip this custom group
@@ -1697,8 +1721,19 @@ def list_authenticated_providers(
             # built-in alibaba-coding-plan row whenever DASHSCOPE_API_KEY is
             # set. The built-in row carries the curated model list, correct
             # auth wiring, and canonical slug — keep it and hide the shadow.
+            #
+            # Exception: if the custom entry has an explicit ``models:`` dict,
+            # the user has intentionally configured a proxy/gateway that fronts
+            # multiple backends at a single URL (e.g. an Aperture proxy). In
+            # that case, always surface the custom row — its model list is more
+            # accurate than the built-in curated snapshot.
             _grp_url_norm = _pair_key[1]
-            if _grp_url_norm and _grp_url_norm in _builtin_endpoints:
+            # If the group already has models populated from explicit ``models:``
+            # dict entries in config, the user intentionally defined this provider
+            # (e.g. a proxy/gateway fronting multiple backends at a single URL).
+            # In that case, always surface the row rather than suppressing it.
+            _entry_has_explicit_models = bool(grp.get("models"))
+            if _grp_url_norm and _grp_url_norm in _builtin_endpoints and not _entry_has_explicit_models:
                 continue
             # Live model discovery from custom provider endpoints (matches
             # Section 3 behavior for user ``providers:`` entries).
@@ -1707,10 +1742,14 @@ def list_authenticated_providers(
             # auth.  The CLI's _model_flow_named_custom always probes, so
             # the Telegram/Discord picker should do the same for parity.
             # Live-discovery policy:
-            # - With an api_key, the user has explicitly opted into the
-            #   endpoint and live /models is the source of truth — replace
-            #   the (possibly partial) ``models:`` subset configured for
-            #   context-length overrides with the full live catalog.
+            # - With an api_key but with an explicit ``models:`` dict,
+            #   the user has intentionally scoped this provider entry to a
+            #   subset of the proxy's catalog (e.g. an Aperture gateway
+            #   fronting multiple backends). Preserve the explicit list and
+            #   skip live discovery — the proxy's /v1/models would return
+            #   all models across all backends, not just this provider's.
+            # - With an api_key and no explicit models, live /models is the
+            #   source of truth — replace any partial ``models:`` subset.
             #   This is the Bifrost / aggregator-gateway case.
             # - Without an api_key but with an explicit ``models:`` list
             #   (or top-level ``model:``), the user is narrowing a public
@@ -1720,7 +1759,7 @@ def list_authenticated_providers(
             # - Without an api_key AND no explicit models, fall through to
             #   live discovery so bare-endpoint custom providers (local
             #   llama.cpp / Ollama servers) still appear populated.
-            should_probe = bool(api_url) and (bool(api_key) or not grp["models"])
+            should_probe = bool(api_url) and (bool(api_key) or not grp["models"]) and not _entry_has_explicit_models
             if should_probe:
                 try:
                     from hermes_cli.models import fetch_api_models
