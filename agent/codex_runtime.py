@@ -469,6 +469,24 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                 )
                 continue
             raise
+        except TypeError as exc:
+            # Some Responses API proxies (e.g. Aperture) emit
+            # ``response.output_text.delta`` without first sending the
+            # ``response.content_part.added`` event.  The OpenAI SDK's
+            # streaming state machine initialises ``output.content`` as
+            # ``None`` until that event arrives, so the delta handler
+            # tries ``None[content_index]`` and raises TypeError:
+            # ``'NoneType' object is not subscriptable``.
+            # The non-streaming fallback path works correctly because it
+            # reads the final response object directly.
+            logger.debug(
+                "Responses stream raised TypeError (likely missing "
+                "content_part.added event from proxy); falling back to "
+                "create(stream=True). %s error=%s",
+                agent._client_log_context(),
+                exc,
+            )
+            return agent._run_codex_create_stream_fallback(api_kwargs, client=active_client)
 
         try:
             # Compatibility: some mocks/providers return a concrete response
