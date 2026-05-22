@@ -747,6 +747,7 @@ def handle_function_call(
     user_task: Optional[str] = None,
     enabled_tools: Optional[List[str]] = None,
     skip_pre_tool_call_hook: bool = False,
+    skip_post_tool_call_hook: bool = False,
 ) -> str:
     """
     Main function call dispatcher that routes calls to the tool registry.
@@ -846,20 +847,21 @@ def handle_function_call(
             )
         duration_ms = int((time.monotonic() - _dispatch_start) * 1000)
 
-        try:
-            from hermes_cli.plugins import invoke_hook
-            invoke_hook(
-                "post_tool_call",
-                tool_name=function_name,
-                args=function_args,
-                result=result,
-                task_id=task_id or "",
-                session_id=session_id or "",
-                tool_call_id=tool_call_id or "",
-                duration_ms=duration_ms,
-            )
-        except Exception as _hook_err:
-            logger.debug("post_tool_call hook error: %s", _hook_err)
+        if not skip_post_tool_call_hook:
+            try:
+                from hermes_cli.plugins import invoke_hook
+                invoke_hook(
+                    "post_tool_call",
+                    tool_name=function_name,
+                    args=function_args,
+                    result=result,
+                    task_id=task_id or "",
+                    session_id=session_id or "",
+                    tool_call_id=tool_call_id or "",
+                    duration_ms=duration_ms,
+                )
+            except Exception as _hook_err:
+                logger.debug("post_tool_call hook error: %s", _hook_err)
 
         # Generic tool-result canonicalization seam: plugins receive the
         # final result string (JSON, usually) and may replace it by

@@ -252,6 +252,25 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         else:
             logger.info("tool %s completed (%.2fs, %d chars)", function_name, duration, len(result))
         results[index] = (function_name, function_args, result, duration, is_error, False)
+        # Fire post_tool_call from the worker thread rather than after the
+        # batch completes.  This mirrors how pre_tool_call fires per-tool
+        # (not per-batch) and gives plugins the most accurate duration_ms.
+        # Plugin callbacks must be thread-safe; invoke_hook wraps each in
+        # its own try/except so a misbehaving plugin cannot kill the worker.
+        try:
+            from hermes_cli.plugins import invoke_hook
+            invoke_hook(
+                "post_tool_call",
+                tool_name=function_name,
+                args=function_args,
+                result=result,
+                task_id=effective_task_id or "",
+                session_id=getattr(agent, "session_id", "") or "",
+                tool_call_id=getattr(tool_call, "id", "") or "",
+                duration_ms=int(duration * 1000),
+            )
+        except Exception as _hook_err:
+            logging.debug("post_tool_call hook error (concurrent): %s", _hook_err)
         # Tear down worker-tid tracking.  Clear any interrupt bit we may
         # have set so the next task scheduled onto this recycled tid
         # starts with a clean slate.
@@ -752,6 +771,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     session_id=agent.session_id or "",
                     enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
                     skip_pre_tool_call_hook=True,
+                    skip_post_tool_call_hook=True,
                 )
                 _spinner_result = function_result
             except Exception as tool_error:
@@ -772,6 +792,7 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                     session_id=agent.session_id or "",
                     enabled_tools=list(agent.valid_tool_names) if agent.valid_tool_names else None,
                     skip_pre_tool_call_hook=True,
+                    skip_post_tool_call_hook=True,
                 )
             except Exception as tool_error:
                 function_result = f"Error executing tool '{function_name}': {tool_error}"
@@ -827,6 +848,22 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
                 )
             except Exception as cb_err:
                 logging.debug(f"Tool progress callback error: {cb_err}")
+
+        if not _execution_blocked:
+            try:
+                from hermes_cli.plugins import invoke_hook
+                invoke_hook(
+                    "post_tool_call",
+                    tool_name=function_name,
+                    args=function_args,
+                    result=function_result,
+                    task_id=effective_task_id or "",
+                    session_id=getattr(agent, "session_id", "") or "",
+                    tool_call_id=getattr(tool_call, "id", "") or "",
+                    duration_ms=int(tool_duration * 1000),
+                )
+            except Exception as _hook_err:
+                logging.debug("post_tool_call hook error: %s", _hook_err)
 
         agent._current_tool = None
         agent._touch_activity(f"tool completed: {function_name} ({tool_duration:.1f}s)")
