@@ -1230,6 +1230,7 @@ def prewarm_picker_cache_async() -> Optional["_threading.Thread"]:
                 current_model=ctx.current_model,
                 user_providers=ctx.user_providers,
                 custom_providers=ctx.custom_providers,
+                excluded_providers=ctx.excluded_providers or [],
             )
         except Exception:
             # Best-effort warmup — never surface errors into the session.
@@ -1250,6 +1251,7 @@ def list_authenticated_providers(
     max_models: int | None = None,
     current_model: str = "",
     refresh: bool = False,
+    excluded_providers: list | None = None,
 ) -> List[dict]:
     """Detect which providers have credentials and list their curated models.
 
@@ -1305,6 +1307,11 @@ def list_authenticated_providers(
     results: List[dict] = []
     seen_slugs: set = set()  # lowercase-normalized to catch case variants (#9545)
     seen_mdev_ids: set = set()  # prevent duplicate entries for aliases (e.g. kimi-coding + kimi-coding-cn)
+    # Normalize the excluded-providers list once for fast membership checks.
+    # Compared against hermes_id / mdev_id (section 1), pid / hermes_slug
+    # (section 2) and canonical slug (section 2b) so a single entry like
+    # ``copilot`` hides the provider regardless of which key it surfaces under.
+    _excluded: set = {str(p).strip().lower() for p in (excluded_providers or []) if p}
     # Effective base URLs of every built-in row we emit (normalized lower+rstrip).
     # Section 4 uses this to hide ``custom_providers`` entries that point at the
     # same endpoint as a built-in (e.g. a user-defined "my-dashscope" on
@@ -1444,6 +1451,8 @@ def list_authenticated_providers(
         # The first one with valid credentials wins (#10526).
         if mdev_id in seen_mdev_ids:
             continue
+        if hermes_id.lower() in _excluded or mdev_id.lower() in _excluded:
+            continue
         pdata = data.get(mdev_id)
         if not isinstance(pdata, dict):
             continue
@@ -1521,6 +1530,8 @@ def list_authenticated_providers(
         # Resolve Hermes slug — e.g. "github-copilot" → "copilot"
         hermes_slug = _mdev_to_hermes.get(pid, pid)
         if hermes_slug.lower() in seen_slugs:
+            continue
+        if pid.lower() in _excluded or hermes_slug.lower() in _excluded:
             continue
 
         # Check if credentials exist
@@ -1675,6 +1686,8 @@ def list_authenticated_providers(
 
     for _cp in _canon_provs:
         if _cp.slug.lower() in seen_slugs:
+            continue
+        if _cp.slug.lower() in _excluded:
             continue
 
         # Check credentials via PROVIDER_REGISTRY (auth.py)
@@ -1892,11 +1905,17 @@ def list_authenticated_providers(
     if custom_providers and isinstance(custom_providers, list):
         from collections import OrderedDict
 
-        # Key by endpoint + credential identity + wire protocol instead of
-        # slug: names frequently differ per model ("Ollama — X") while the
-        # endpoint stays the same.  Keep same-host providers with distinct
-        # env-backed credentials or API protocols separate so picker selection
-        # cannot route through the wrong credential/mode pair.
+        # Key by endpoint + credential identity + wire protocol + display
+        # prefix instead of slug: names frequently differ per model
+        # ("Ollama — X") while the endpoint stays the same.  Keep same-host
+        # providers with distinct env-backed credentials or API protocols
+        # separate so picker selection cannot route through the wrong
+        # credential/mode pair. The display prefix (text before " — " /
+        # " - ") is included so intentionally distinct providers sharing an
+        # endpoint (e.g. a proxy fronting cerebras, groq and perplexity at
+        # a single base_url) each get their own picker row instead of
+        # collapsing into one. Per-model suffix entries that share the same
+        # prefix ("Ollama — A", "Ollama — B") still group together.
         groups: "OrderedDict[tuple, dict]" = OrderedDict()
         for entry in custom_providers:
             if not isinstance(entry, dict):
@@ -1934,19 +1953,19 @@ def list_authenticated_providers(
             if isinstance(discover, str):
                 discover = discover.lower() not in {"false", "no", "0"}
 
-            group_key = (api_url, credential_identity, api_mode)
+            # Display-name prefix (text before " — " / " - "), used both
+            # as a grouping dimension and to derive the row's display name.
+            _display_prefix = raw_name
+            for sep in ("—", " - "):
+                if sep in _display_prefix:
+                    _display_prefix = _display_prefix.split(sep)[0].strip()
+                    break
+
+            group_key = (api_url, credential_identity, api_mode, _display_prefix.lower())
             if group_key not in groups:
-                # Strip per-model suffix so "Ollama — GLM 5.1" becomes
-                # "Ollama" for the grouped row. Em dash is the convention
-                # Hermes's own writer uses; a hyphen variant is accepted
-                # for hand-edited configs.
-                display_name = raw_name
-                for sep in ("—", " - "):
-                    if sep in display_name:
-                        display_name = display_name.split(sep)[0].strip()
-                        break
-                if not display_name:
-                    display_name = raw_name
+                # Reuse the prefix computed above as the row display name;
+                # fall back to the raw name if stripping left it empty.
+                display_name = _display_prefix or raw_name
                 slug = custom_provider_slug(display_name)
                 groups[group_key] = {
                     "slug": slug,
@@ -2102,6 +2121,7 @@ def list_picker_providers(
     custom_providers: list | None = None,
     max_models: int | None = None,
     current_model: str = "",
+    excluded_providers: list | None = None,
 ) -> List[dict]:
     """Interactive-picker variant of :func:`list_authenticated_providers`.
 
@@ -2131,6 +2151,7 @@ def list_picker_providers(
         custom_providers=custom_providers,
         max_models=max_models,
         current_model=current_model,
+        excluded_providers=excluded_providers,
     )
 
     filtered: List[dict] = []

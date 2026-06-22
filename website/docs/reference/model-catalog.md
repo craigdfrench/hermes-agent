@@ -88,6 +88,20 @@ model_catalog:
 
 The overriding manifest only needs to populate the provider block(s) it cares about. Other providers continue to resolve against the master URL.
 
+### Hiding providers from the picker
+
+`excluded_providers` lets you hide specific providers from the `/model` picker even when valid credentials exist. Useful when credentials are present for legacy or testing providers that shouldn't appear in normal use (e.g. an old Copilot or OpenRouter token still cached in `auth.json` or discovered via the `gh` CLI).
+
+```yaml
+model_catalog:
+  excluded_providers:
+    - copilot
+    - openrouter
+    - openai
+```
+
+The exclusion is matched case-insensitively against every key a provider can surface under — the Hermes id and models.dev id (built-in mapped providers), the overlay pid and resolved Hermes slug (overlay providers), and the canonical slug (canonical providers) — so a single entry like `copilot` hides the provider regardless of which section emits it. An empty list (or omitting the key) has no effect.
+
 ## Updating the manifest
 
 Maintainers:
