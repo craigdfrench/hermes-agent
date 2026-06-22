@@ -647,3 +647,141 @@ class TestReasoningPrimaryToStrictFallback:
         api_msg: dict = {"role": "assistant", "tool_calls": [{"id": "a"}]}
         mistral._copy_reasoning_content_for_api(source, api_msg)
         assert "reasoning_content" not in api_msg
+
+
+class TestStrictProviderStripsGenuineReasoningContent:
+    """Strict providers must strip reasoning_content even when it is genuine,
+    non-empty text — not just the " " pad or "" placeholder.
+
+    Gap in #50480's coverage: its tests only exercise the space-pad (DeepSeek
+    primary) and empty-string (pre-#17341) shapes. This class covers the
+    streaming-promotion path from #16844: streaming-only reasoning models
+    (GLM, MiniMax, gpt-oss-120b) emit ``reasoning_content`` deltas that get
+    promoted into stored history as real reasoning text. Replaying that
+    history through a strict OpenAI-compatible provider (Cerebras, Groq,
+    Fireworks, Together, …) 400s on the genuine field::
+
+        messages.2.assistant.reasoning_content: property
+        'messages.2.assistant.reasoning_content' is unsupported
+
+    Ported from the unsalvageable PR #34182 (superseded by #50480); reframed
+    to test behaviour against the merged implementation rather than the
+    ``_rejects_reasoning_content()`` helper that #50480 did not introduce.
+    Refs #16844, #45655.
+    """
+
+    def test_glm_history_stripped_for_cerebras_rebuild(self) -> None:
+        """GLM turn stored with promoted reasoning_content is stripped on the
+        rebuild path (copy_reasoning_content_for_api) when replaying through a
+        Cerebras-style custom provider."""
+        cerebras = _make_agent(
+            provider="custom:cerebras",
+            model="gpt-oss-120b",
+            base_url="https://proxy.example.com/v1",
+        )
+        # History turn written by zai-glm-4.7 with promoted reasoning_content
+        glm_history_turn = {
+            "role": "assistant",
+            "content": "Hello!",
+            "reasoning": "Let me think...",
+            "reasoning_content": "Let me think...",  # promoted by #16844
+        }
+        api_msg: dict = {"reasoning_content": "Let me think..."}
+        cerebras._copy_reasoning_content_for_api(glm_history_turn, api_msg)
+        assert "reasoning_content" not in api_msg
+
+    def test_glm_history_stripped_for_cerebras_fallback(self) -> None:
+        """Same scenario on the already-built api_messages fallback path:
+        reapply_reasoning_echo_for_provider must strip the genuine pad when the
+        active provider is strict."""
+        from agent.agent_runtime_helpers import reapply_reasoning_echo_for_provider
+
+        cerebras = _make_agent(
+            provider="custom:cerebras",
+            model="gpt-oss-120b",
+            base_url="https://proxy.example.com/v1",
+        )
+        msgs = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "u1"},
+            # GLM-promoted genuine reasoning text on a tool-call turn
+            {"role": "assistant", "content": "",
+             "reasoning_content": "Let me think...",
+             "tool_calls": [{"id": "a", "function": {"name": "terminal"}}]},
+            {"role": "tool", "tool_call_id": "a", "content": "ok"},
+        ]
+        changed = reapply_reasoning_echo_for_provider(cerebras, msgs)
+        assert changed == 1
+        assert "reasoning_content" not in msgs[2]
+
+    def test_echo_back_provider_preserves_genuine_reasoning(self) -> None:
+        """Contrast: an echo-back provider (DeepSeek) must KEEP genuine
+        reasoning_content on replay — stripping is strict-provider only."""
+        agent = _make_agent(provider="deepseek", model="deepseek-v4-flash")
+        source = {
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": "some thought",
+            "tool_calls": [{"id": "c1", "function": {"name": "terminal"}}],
+        }
+        api_msg: dict = {}
+        agent._copy_reasoning_content_for_api(source, api_msg)
+        assert api_msg["reasoning_content"] == "some thought"
+
+
+class TestStrictProviderMatrix:
+    """``copy_reasoning_content_for_api`` strips reasoning_content for every
+    strict OpenAI-compatible provider, not just Mistral/Codex.
+
+    #50480's merged tests only pin mistral and codex as strict providers. This
+    matrix broadens the regression net to the providers named in the original
+    report (Groq, Fireworks, Together, OpenRouter) plus the custom-provider
+    models (gpt-oss-120b, GLM, Llama, Qwen) that route through Cerebras-style
+    OpenAI-compatible endpoints. Echo-back providers (DeepSeek, Kimi, MiMo)
+    are pinned as the non-strict controls. Ported from PR #34182. Refs #45655.
+    """
+
+    @pytest.mark.parametrize("provider,model,base_url", [
+        ("custom", "zai-glm-4.7", "https://proxy.example.com/v1"),
+        ("custom", "gpt-oss-120b", "https://proxy.example.com/v1"),
+        ("custom", "llama3.1-8b", "https://proxy.example.com/v1"),
+        ("custom", "qwen-3-235b-a22b-instruct-2507", "https://proxy.example.com/v1"),
+        ("groq", "llama-3.1-70b-versatile", "https://api.groq.com/openai/v1"),
+        ("fireworks", "llama-v3-70b", "https://api.fireworks.ai/inference/v1"),
+        ("together", "meta-llama/Llama-3-70B", "https://api.together.xyz/v1"),
+        ("openrouter", "anthropic/claude-sonnet-4.6", "https://openrouter.ai/api/v1"),
+    ])
+    def test_strict_provider_strips_reasoning_content(
+        self, provider: str, model: str, base_url: str
+    ) -> None:
+        agent = _make_agent(provider=provider, model=model, base_url=base_url)
+        # Sanity: these are NOT echo-back providers.
+        assert agent._needs_thinking_reasoning_pad() is False
+        source = {
+            "role": "assistant",
+            "content": "hi",
+            "reasoning_content": "genuine reasoning text",
+        }
+        api_msg: dict = {"reasoning_content": "genuine reasoning text"}
+        agent._copy_reasoning_content_for_api(source, api_msg)
+        assert "reasoning_content" not in api_msg
+
+    @pytest.mark.parametrize("provider,model,base_url", [
+        ("deepseek", "deepseek-v4-flash", ""),
+        ("kimi-coding", "kimi-k2", ""),
+        ("custom", "mimo-v2-pro", "https://api.xiaomimimo.com/v1"),
+    ])
+    def test_echo_back_provider_preserves_reasoning_content(
+        self, provider: str, model: str, base_url: str
+    ) -> None:
+        agent = _make_agent(provider=provider, model=model, base_url=base_url)
+        assert agent._needs_thinking_reasoning_pad() is True
+        source = {
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": "genuine reasoning text",
+            "tool_calls": [{"id": "c1", "function": {"name": "terminal"}}],
+        }
+        api_msg: dict = {}
+        agent._copy_reasoning_content_for_api(source, api_msg)
+        assert api_msg["reasoning_content"] == "genuine reasoning text"
